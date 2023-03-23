@@ -1,21 +1,62 @@
 use std::collections::HashMap;
-use axum::{routing::get, Router};
+use std::env;
 use std::net::SocketAddr;
 use std::time::SystemTime;
-use serde_json::Value::Bool;
-use serde::{Serialize, Deserialize};
-use tokio::time;
-use crate::EVSEStatus::Occupied;
-use elasticsearch::{Elasticsearch, auth::Credentials, Error, http::transport::Transport, UpdateByQuery, Update, UpdateParts, CreateParts, BulkUpdateOperation, BulkOperation, BulkParts};
+
+use axum::{Router, routing::get};
+use elasticsearch::{auth::Credentials, BulkOperation, BulkParts, BulkUpdateOperation, CreateParts, Elasticsearch, Error, http::transport::Transport, Update, UpdateByQuery, UpdateParts};
 use elasticsearch::http::Method;
 use elasticsearch::http::Method::Post;
 use elasticsearch::http::request::JsonBody;
 use elasticsearch::ingest::IngestPutPipelineParts;
 use elasticsearch::params::OpType::Create;
 use hyper::HeaderMap;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use serde_json::Value::{Bool, Object};
+use tokio::time;
 
-// use tower_http::cors::{Any, CorsLayer};
+use dotenv::dotenv;
+
+use crate::EVSEStatus::Occupied;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EVSEDataResponse {
+    #[serde(rename = "EVSEData")]
+    evse_data: Vec<EVSEDataRecordContainer>
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EVSEDataRecordContainer {
+    #[serde(rename = "EVSEDataRecord")]
+    evse_data_record: Vec<EVSEDataRecord>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EVSEDataRecord {
+    #[serde(rename = "GeoCoordinates")]
+    geo_coordinates: Google,
+    #[serde(rename = "lastUpdate")]
+    last_update: Option<String>, //ISODate
+    #[serde(rename = "EvseID")]
+    evse_id: String,
+    #[serde(rename = "Address")]
+    address: Address,
+    #[serde(rename = "ChargingFacilities")]
+    charging_facilities: Vec<Map<String, Value>>
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Google {
+    #[serde(rename = "Google")]
+    google: String
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+struct Address {
+    postal_code: Option<String>
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -72,40 +113,34 @@ impl Charging {
 struct Realtime {
     last_update: SystemTime,
     occupied: bool,
-    nominal_max_power: f64,
-    estimated_power: Option<f64>,
+    nominal_max_power: f64, //grösste
+    estimated_power: Option<f64>, //immer min. 11
     canton: Option<String>,
     zip: String,
     location: [f64;2]
 }
 
-// kanton, plz, koordinaten
-
-// TODO: Kanton form Coordinates
-
+enum IntOrString {
+    Int(i32),
+    String(String),
+}
 
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
 
-    let transport = Transport::cloud(cloud_id, credentials).unwrap();
+    let data_response = fetch_evse_data().await;
+    for container in data_response.evse_data {
+        for record in container.evse_data_record {
+
+        }
+    }
+
+    let elastic_endpoint = env::var("ELASTIC_ENDPOINT").unwrap();
+    let cloud_id= env::var("ELASTIC_ID").unwrap();
+    let credentials = Credentials::Basic(env::var("ELASTIC_USERNAME").unwrap(), env::var("ELASTIC_PASSWORD").unwrap());
+    let transport = Transport::cloud(&cloud_id, credentials).unwrap();
     let client = Elasticsearch::new(transport);
-    println!("Client: {:?}", client);
-
-    let mut ops: Vec<BulkOperation<Value>> = Vec::new();
-    ops.push(BulkOperation::update("3a", json!({
-        "doc": {
-            "message": "tweet updated"
-        },
-        "doc_as_upsert": true
-    })).into());
-
-    let res = client.bulk(BulkParts::Index("tweets"))
-        .body(ops)
-        .send()
-        .await
-        .unwrap();
-
-    println!("{:?}", res);
 
     let mut occupied: HashMap<String, Charging> = HashMap::new();
 
@@ -158,16 +193,59 @@ async fn main() {
             }
         }
 
-        // let mut occupiedCount = 0;
-        // for (key, value) in slots.into_iter() {
-        //     if value == Occupied {
-        //         occupiedCount += 1;
-        //     }
-        // }
+        let mut occupiedCount = 0;
+        for (key, value) in slots.into_iter() {
+            if value == Occupied {
+                occupiedCount += 1;
+            }
+        }
 
         println!("Newly unoccupied: {:?}", newly_unoccupied);
-        // println!("Realtime: {:?}", realtime);
 
+        let data_response = fetch_evse_data().await;
+        for container in data_response.evse_data {
+            for record in container.evse_data_record {
+
+            }
+        }
+
+        let mut ops: Vec<BulkOperation<Value>> = Vec::new();
+        for (index, no) in &newly_unoccupied {
+            let mut update_map: HashMap<String, Value> = HashMap::new();
+            update_map.insert(String::from("doc"), serde_json::to_value(&no).unwrap());
+            update_map.insert(String::from("doc_as_upsert"), json!(true));
+            ops.push(BulkOperation::from(BulkOperation::update(index.clone(), serde_json::to_value(&update_map).unwrap())))
+        }
+
+        if(&newly_unoccupied.len() > &0) {
+            let res = client.bulk(BulkParts::Index("charging"))
+                .body(ops)
+                .send()
+                .await
+                .unwrap();
+
+            println!("{:?}", res);
+        }
+
+        let mut rtOps: Vec<BulkOperation<Value>> = Vec::new();
+        for (index, rt) in &realtime{
+            let mut update_map: HashMap<String, Value> = HashMap::new();
+            update_map.insert(String::from("doc"), serde_json::to_value(&rt).unwrap());
+            update_map.insert(String::from("doc_as_upsert"), json!(true));
+            rtOps.push(BulkOperation::from(BulkOperation::update(index.clone(), serde_json::to_value(&update_map).unwrap())))
+        }
+
+        let res = client.bulk(BulkParts::Index("realtime"))
+            .body(rtOps)
+            .send()
+            .await
+            .unwrap();
+
+        println!("{:?}", res);
+
+
+
+        println!("{:?}", occupied);
         time::sleep(time::Duration::from_secs(2)).await
     }
 }
@@ -192,16 +270,11 @@ fn lookup_nominal_power(p0: &String) -> f64 {
     return 42_f64;
 }
 
-// async fn root() {
-//     println!("entering root handler");
-// }
-
-
-// async fn fetch_evse_data() {
-//     let uri = "https://data.geo.admin.ch/ch.bfe.ladestellen-elektromobilitaet/data/ch.bfe.ladestellen-elektromobilitaet.json";
-//     let resp = reqwest::get(uri).await.unwrap().bytes().await;
-//     println!("Response: {:?}", resp);
-// }
+async fn fetch_evse_data() -> EVSEDataResponse {
+    let uri = "https://data.geo.admin.ch/ch.bfe.ladestellen-elektromobilitaet/data/ch.bfe.ladestellen-elektromobilitaet.json";
+    let resp = reqwest::get(uri).await.unwrap().json::<EVSEDataResponse>().await.unwrap();
+    resp
+}
 
 async fn fetch_evse_status() -> EVSEStatusResponse {
     let uri = "https://data.geo.admin.ch/ch.bfe.ladestellen-elektromobilitaet/status/ch.bfe.ladestellen-elektromobilitaet.json";
