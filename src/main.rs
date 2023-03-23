@@ -1,19 +1,10 @@
 use std::collections::HashMap;
 use std::env;
-use std::net::SocketAddr;
 use std::time::SystemTime;
 
-use axum::{Router, routing::get};
-use elasticsearch::{auth::Credentials, BulkOperation, BulkParts, BulkUpdateOperation, CreateParts, Elasticsearch, Error, http::transport::Transport, Update, UpdateByQuery, UpdateParts};
-use elasticsearch::http::Method;
-use elasticsearch::http::Method::Post;
-use elasticsearch::http::request::JsonBody;
-use elasticsearch::ingest::IngestPutPipelineParts;
-use elasticsearch::params::OpType::Create;
-use hyper::HeaderMap;
+use elasticsearch::{auth::Credentials, BulkOperation, BulkParts, Elasticsearch, http::transport::Transport};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use serde_json::Value::{Bool, Object};
 use tokio::time;
 
 use dotenv::dotenv;
@@ -129,20 +120,21 @@ enum IntOrString {
 async fn main() {
     dotenv().ok();
 
-    let data_response = fetch_evse_data().await;
-    for container in data_response.evse_data {
-        for record in container.evse_data_record {
 
-        }
-    }
-
-    let elastic_endpoint = env::var("ELASTIC_ENDPOINT").unwrap();
+    // let elastic_endpoint = env::var("ELASTIC_ENDPOINT").unwrap();
     let cloud_id= env::var("ELASTIC_ID").unwrap();
     let credentials = Credentials::Basic(env::var("ELASTIC_USERNAME").unwrap(), env::var("ELASTIC_PASSWORD").unwrap());
     let transport = Transport::cloud(&cloud_id, credentials).unwrap();
     let client = Elasticsearch::new(transport);
 
     let mut occupied: HashMap<String, Charging> = HashMap::new();
+
+    let data_response = fetch_evse_data().await;
+    for container in data_response.evse_data {
+        for record in container.evse_data_record {
+
+        }
+    }
 
     loop {
         let mut realtime: HashMap<String, Realtime> = HashMap::new();
@@ -164,7 +156,7 @@ async fn main() {
                 });
 
                 if status.evse_status == Occupied {
-                    if let Some(occ) = occupied.get(&status.evse_id) {
+                    if let Some(_) = occupied.get(&status.evse_id) {
                         // do nothing, was already occupied
                     } else {
                         // newly occupied
@@ -193,21 +185,7 @@ async fn main() {
             }
         }
 
-        let mut occupiedCount = 0;
-        for (key, value) in slots.into_iter() {
-            if value == Occupied {
-                occupiedCount += 1;
-            }
-        }
-
         println!("Newly unoccupied: {:?}", newly_unoccupied);
-
-        let data_response = fetch_evse_data().await;
-        for container in data_response.evse_data {
-            for record in container.evse_data_record {
-
-            }
-        }
 
         let mut ops: Vec<BulkOperation<Value>> = Vec::new();
         for (index, no) in &newly_unoccupied {
@@ -217,7 +195,7 @@ async fn main() {
             ops.push(BulkOperation::from(BulkOperation::update(index.clone(), serde_json::to_value(&update_map).unwrap())))
         }
 
-        if(&newly_unoccupied.len() > &0) {
+        if &newly_unoccupied.len() > &0 {
             let res = client.bulk(BulkParts::Index("charging"))
                 .body(ops)
                 .send()
@@ -227,16 +205,16 @@ async fn main() {
             println!("{:?}", res);
         }
 
-        let mut rtOps: Vec<BulkOperation<Value>> = Vec::new();
+        let mut rt_ops: Vec<BulkOperation<Value>> = Vec::new();
         for (index, rt) in &realtime{
             let mut update_map: HashMap<String, Value> = HashMap::new();
             update_map.insert(String::from("doc"), serde_json::to_value(&rt).unwrap());
             update_map.insert(String::from("doc_as_upsert"), json!(true));
-            rtOps.push(BulkOperation::from(BulkOperation::update(index.clone(), serde_json::to_value(&update_map).unwrap())))
+            rt_ops.push(BulkOperation::from(BulkOperation::update(index.clone(), serde_json::to_value(&update_map).unwrap())))
         }
 
         let res = client.bulk(BulkParts::Index("realtime"))
-            .body(rtOps)
+            .body(rt_ops)
             .send()
             .await
             .unwrap();
