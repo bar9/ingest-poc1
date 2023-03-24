@@ -1,6 +1,9 @@
+use std::alloc::System;
+use std::cmp::max;
 use std::collections::HashMap;
 use std::env;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
 
 use elasticsearch::{auth::Credentials, BulkOperation, BulkParts, Elasticsearch, http::transport::Transport};
 use serde::{Deserialize, Serialize};
@@ -28,7 +31,7 @@ struct EVSEDataRecord {
     #[serde(rename = "GeoCoordinates")]
     geo_coordinates: Google,
     #[serde(rename = "lastUpdate")]
-    last_update: Option<String>, //ISODate
+    last_update: Option<String>,
     #[serde(rename = "EvseID")]
     evse_id: String,
     #[serde(rename = "Address")]
@@ -83,18 +86,17 @@ struct EVSEStatusRecord{
 // Elastic Interface!
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Charging {
-    start: SystemTime,
-    end: Option<SystemTime>,
+    start: u64,
+    end: Option<u64>,
     nominal_max_power: f64,
     estimated_power: Option<f64>,
     charger: String,
-    canton: Option<String>,
     zip: String,
     location: [f64;2],
 }
 
 impl Charging {
-    pub fn set_end(&mut self, end: SystemTime) {
+    pub fn set_end(&mut self, end: u64) {
         self.end = Some(end);
     }
 }
@@ -102,11 +104,10 @@ impl Charging {
 // Elastic Interface!
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Realtime {
-    last_update: SystemTime,
+    last_update: u64,
     occupied: bool,
     nominal_max_power: f64, //grösste
     estimated_power: Option<f64>, //immer min. 11
-    canton: Option<String>,
     zip: String,
     location: [f64;2]
 }
@@ -120,8 +121,6 @@ enum IntOrString {
 async fn main() {
     dotenv().ok();
 
-
-    // let elastic_endpoint = env::var("ELASTIC_ENDPOINT").unwrap();
     let cloud_id= env::var("ELASTIC_ID").unwrap();
     let credentials = Credentials::Basic(env::var("ELASTIC_USERNAME").unwrap(), env::var("ELASTIC_PASSWORD").unwrap());
     let transport = Transport::cloud(&cloud_id, credentials).unwrap();
@@ -129,12 +128,34 @@ async fn main() {
 
     let mut occupied: HashMap<String, Charging> = HashMap::new();
 
-    let data_response = fetch_evse_data().await;
-    for container in data_response.evse_data {
-        for record in container.evse_data_record {
+    let mut lookup_table: HashMap<String, LookupTableEntry> = HashMap::new();
 
+    async fn refresh_lookup_table(lookup_table: &mut HashMap<String, LookupTableEntry>) {
+        let data_response = fetch_evse_data().await;
+        for container in data_response.evse_data {
+            for record in container.evse_data_record {
+                let coords_str: Vec<&str> = record.geo_coordinates.google.split(' ').collect();
+                let coords_flt = [coords_str[0].parse::<f64>().unwrap(), coords_str[1].parse::<f64>().unwrap()];
+                let max_nominal_power = record.charging_facilities.into_iter()
+                    .fold(0_f64, |prev, next|
+                        if let Some(x) = next.get("power") {
+                            x.as_f64().unwrap_or(f64::from_str(x.as_str().unwrap_or("")).unwrap_or(11_f64))
+                        } else { 11_f64 });
+                let estimated_power = 0.6 * if max_nominal_power > 11_f64 {max_nominal_power} else {11_f64};
+
+                let lte = LookupTableEntry{
+                    location: coords_flt,
+                    zip: record.address.postal_code.unwrap_or(String::from("-")),
+                    canton: "BE".to_string(),
+                    estimated_power: estimated_power,
+                    max_nominal_power: max_nominal_power
+                };
+                lookup_table.insert(record.evse_id, lte);
+            }
         }
     }
+
+    refresh_lookup_table(&mut lookup_table).await;
 
     loop {
         let mut realtime: HashMap<String, Realtime> = HashMap::new();
@@ -145,14 +166,14 @@ async fn main() {
         let status_response = fetch_evse_status().await;
         for container in status_response.evse_statuses {
             for status in container.evse_status_record {
+                let lookup_entry = lookup_table.get(&status.evse_id).unwrap();
                 realtime.insert(status.evse_id.clone(), Realtime {
-                    last_update: SystemTime::now(),
+                    last_update: now(),
                     occupied: status.evse_status == Occupied,
-                    nominal_max_power: lookup_nominal_power(&status.evse_id),
-                    estimated_power: lookup_estimated_power(&status.evse_id),
-                    canton: lookup_canton(&status.evse_id),
-                    zip: lookup_zip(&status.evse_id),
-                    location: lookup_location(&status.evse_id),
+                    nominal_max_power: lookup_entry.max_nominal_power,
+                    estimated_power: Some(lookup_entry.estimated_power.clone()),
+                    zip: lookup_entry.zip.clone(),
+                    location: lookup_entry.location
                 });
 
                 if status.evse_status == Occupied {
@@ -161,20 +182,19 @@ async fn main() {
                     } else {
                         // newly occupied
                         occupied.insert(status.evse_id.clone(), Charging {
-                            start: SystemTime::now(),
+                            start: now(),
                             end: None,
-                            nominal_max_power: lookup_nominal_power(&status.evse_id),
-                            estimated_power: lookup_estimated_power(&status.evse_id),
+                            nominal_max_power: lookup_entry.max_nominal_power,
+                            estimated_power: Some(lookup_entry.estimated_power.clone()),
+                            zip: lookup_entry.zip.clone(),
+                            location: lookup_entry.location,
                             charger: status.evse_id.clone(),
-                            canton: lookup_canton(&status.evse_id),
-                            zip: lookup_zip(&status.evse_id),
-                            location: lookup_location(&status.evse_id)
                         });
                     }
                 } else {
                     if let Some(occ) = occupied.get(&status.evse_id) {
                         let mut occ = occ.clone();
-                        occ.set_end(SystemTime::now());
+                        occ.set_end(now());
                         newly_unoccupied.insert(status.evse_id.clone(), (occ).clone());
                         occupied.remove(&status.evse_id);
                     } else {
@@ -185,7 +205,7 @@ async fn main() {
             }
         }
 
-        println!("Newly unoccupied: {:?}", newly_unoccupied);
+        // println!("Newly unoccupied: {:?}", newly_unoccupied);
 
         let mut ops: Vec<BulkOperation<Value>> = Vec::new();
         for (index, no) in &newly_unoccupied {
@@ -202,10 +222,12 @@ async fn main() {
                 .await
                 .unwrap();
 
-            println!("{:?}", res);
+            println!("Charging bulk updated: {:?}", res);
         }
 
         let mut rt_ops: Vec<BulkOperation<Value>> = Vec::new();
+        println!("{:?}", realtime);
+
         for (index, rt) in &realtime{
             let mut update_map: HashMap<String, Value> = HashMap::new();
             update_map.insert(String::from("doc"), serde_json::to_value(&rt).unwrap());
@@ -219,33 +241,18 @@ async fn main() {
             .await
             .unwrap();
 
-        println!("{:?}", res);
+        println!("Realtime bulk updated: {:?}", res);
 
-
-
-        println!("{:?}", occupied);
-        time::sleep(time::Duration::from_secs(2)).await
+        time::sleep(time::Duration::from_secs(120)).await
     }
 }
 
-fn lookup_location(p0: &String) -> [f64; 2] {
-    return [42_f64, 42_f64];
-}
-
-fn lookup_zip(p0: &String) -> String {
-    return String::from("3000");
-}
-
-fn lookup_canton(p0: &String) -> Option<String> {
-    return Some(String::from("BE"));
-}
-
-fn lookup_estimated_power(p0: &String) -> Option<f64> {
-    return Some(42_f64);
-}
-
-fn lookup_nominal_power(p0: &String) -> f64 {
-    return 42_f64;
+struct LookupTableEntry {
+    location: [f64; 2],
+    zip: String,
+    canton: String,
+    estimated_power: f64,
+    max_nominal_power: f64
 }
 
 async fn fetch_evse_data() -> EVSEDataResponse {
@@ -258,4 +265,9 @@ async fn fetch_evse_status() -> EVSEStatusResponse {
     let uri = "https://data.geo.admin.ch/ch.bfe.ladestellen-elektromobilitaet/status/ch.bfe.ladestellen-elektromobilitaet.json";
     let resp = reqwest::get(uri).await.unwrap().json::<EVSEStatusResponse>().await.unwrap();
     resp
+}
+
+fn now() -> u64 {
+    let now = SystemTime::now();
+    now.duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
