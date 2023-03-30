@@ -9,6 +9,7 @@ use elasticsearch::{auth::Credentials, BulkOperation, BulkParts, Elasticsearch, 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::time;
+use uuid::Uuid;
 
 use dotenv::dotenv;
 
@@ -96,15 +97,19 @@ struct Charging {
 }
 
 impl Charging {
-    pub fn set_end(&mut self, end: u64) {
+    pub fn set_end(&mut self, end: u128) {
         self.end = Some(end);
+        let duration_millis = self.end.unwrap() - self.start;
+        let duration_seconds = duration_millis / 1000;
+        let duration_hours: f64 = (duration_seconds as f64) / 3600_f64;
+        self.energy = (duration_hours * self.estimated_power.unwrap());
     }
 }
 
 // Elastic Interface!
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Realtime {
-    last_update: u64,
+    last_update: u128,
     occupied: bool,
     nominal_max_power: f64, //grösste
     estimated_power: Option<f64>, //immer min. 11
@@ -189,6 +194,7 @@ async fn main() {
                             zip: lookup_entry.zip.clone(),
                             location: lookup_entry.location,
                             charger: status.evse_id.clone(),
+                            energy: 0_f64,
                         });
                     }
                 } else {
@@ -212,7 +218,8 @@ async fn main() {
             let mut update_map: HashMap<String, Value> = HashMap::new();
             update_map.insert(String::from("doc"), serde_json::to_value(&no).unwrap());
             update_map.insert(String::from("doc_as_upsert"), json!(true));
-            ops.push(BulkOperation::from(BulkOperation::update(index.clone(), serde_json::to_value(&update_map).unwrap())))
+            let id = Uuid::new_v4();
+            ops.push(BulkOperation::from(BulkOperation::update(id.to_string(), serde_json::to_value(&update_map).unwrap())))
         }
 
         if &newly_unoccupied.len() > &0 {
@@ -243,7 +250,7 @@ async fn main() {
 
         println!("Realtime bulk updated: {:?}", res);
 
-        time::sleep(time::Duration::from_secs(120)).await
+        time::sleep(time::Duration::from_secs(5)).await
     }
 }
 
@@ -267,7 +274,7 @@ async fn fetch_evse_status() -> EVSEStatusResponse {
     resp
 }
 
-fn now() -> u64 {
+fn now() -> u128 {
     let now = SystemTime::now();
-    now.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    now.duration_since(UNIX_EPOCH).unwrap().as_millis()
 }
