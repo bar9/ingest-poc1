@@ -13,114 +13,11 @@ use uuid::Uuid;
 
 use dotenv::dotenv;
 
-use crate::EVSEStatus::Occupied;
-
-#[derive(Serialize, Deserialize, Debug)]
-struct EVSEDataResponse {
-    #[serde(rename = "EVSEData")]
-    evse_data: Vec<EVSEDataRecordContainer>
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct EVSEDataRecordContainer {
-    #[serde(rename = "EVSEDataRecord")]
-    evse_data_record: Vec<EVSEDataRecord>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct EVSEDataRecord {
-    #[serde(rename = "GeoCoordinates")]
-    geo_coordinates: Google,
-    #[serde(rename = "lastUpdate")]
-    last_update: Option<String>,
-    #[serde(rename = "EvseID")]
-    evse_id: String,
-    #[serde(rename = "Address")]
-    address: Address,
-    #[serde(rename = "ChargingFacilities")]
-    charging_facilities: Vec<Map<String, Value>>
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Google {
-    #[serde(rename = "Google")]
-    google: String
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "PascalCase")]
-struct Address {
-    postal_code: Option<String>
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(rename_all = "PascalCase")]
-enum EVSEStatus {
-    Available,
-    Occupied,
-    OutOfService,
-    Unknown
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct EVSEStatusResponse {
-    #[serde(rename = "EVSEStatuses")]
-    evse_statuses: Vec<EVSEStatusRecordContainer>
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct EVSEStatusRecordContainer {
-    #[serde(rename = "EVSEStatusRecord")]
-    evse_status_record: Vec<EVSEStatusRecord>
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct EVSEStatusRecord{
-    #[serde(rename = "EvseID")]
-    evse_id: String,
-    #[serde(rename = "EVSEStatus")]
-    evse_status: EVSEStatus
-}
-
-// Elastic Interface!
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Charging {
-    start: u64,
-    end: Option<u64>,
-    nominal_max_power: f64,
-    estimated_power: Option<f64>,
-    charger: String,
-    zip: String,
-    location: [f64;2],
-}
-
-impl Charging {
-    pub fn set_end(&mut self, end: u128) {
-        self.end = Some(end);
-        let duration_millis = self.end.unwrap() - self.start;
-        let duration_seconds = duration_millis / 1000;
-        let duration_hours: f64 = (duration_seconds as f64) / 3600_f64;
-        self.energy = (duration_hours * self.estimated_power.unwrap());
-    }
-}
-
-// Elastic Interface!
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Realtime {
-    last_update: u128,
-    occupied: bool,
-    nominal_max_power: f64, //grösste
-    estimated_power: Option<f64>, //immer min. 11
-    zip: String,
-    location: [f64;2]
-}
-
-enum IntOrString {
-    Int(i32),
-    String(String),
-}
+mod input_models;
+mod output_models;
+use crate::input_models::*;
+use crate::input_models::EVSEStatus::Occupied;
+use crate::output_models::*;
 
 #[tokio::main]
 async fn main() {
@@ -194,7 +91,7 @@ async fn main() {
                             zip: lookup_entry.zip.clone(),
                             location: lookup_entry.location,
                             charger: status.evse_id.clone(),
-                            energy: 0_f64,
+                            energy: Some(0_f64),
                         });
                     }
                 } else {
